@@ -1,0 +1,13 @@
+
+// generated automatically by ros_hybrid_protoc on  Sun Feb 19 23:22:54 2023
+// Do not Edit!
+// wrapping message: std_msgs/String
+
+syntax = "proto3";
+
+package hybrid.std_msgs;
+
+message String{
+    string data = 1;
+
+}
