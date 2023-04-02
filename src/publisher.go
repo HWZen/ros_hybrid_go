@@ -17,18 +17,6 @@ func NewPublisher(node *Node, topic string, topicType string) (*Publisher, error
 		Topic: topic,
 		Type: topicType,
 	}
-
-	command := protobuf.Command{
-		Type: protobuf.Command_ADVERTISE,
-		Advertise: &protobuf.Command_Advertise{
-			Topic: topic,
-			Type: topicType,
-		},
-	}
-	err := node.Send(&command)
-	if err != nil {
-		return nil, err
-	}
 	return &publisher, nil
 }
 
@@ -44,11 +32,20 @@ func (publisher *Publisher) Publish(msg proto.Message) error {
 			Data: data,
 		},
 	}
-	err = publisher.Node.Send(&command)
-	if err != nil {
-		return err
+	return publisher.Node.Send(&command)
+	
+}
+
+func (publisher *Publisher) Advertise() error {
+	command := protobuf.Command{
+		Type: protobuf.Command_ADVERTISE,
+		Advertise: &protobuf.Command_Advertise{
+			Topic: publisher.Topic,
+			Type:  publisher.Type,
+		},
 	}
-	return nil
+	return publisher.Node.Send(&command)
+	
 }
 
 
@@ -59,9 +56,6 @@ func (publisher *Publisher) Unadvertise() error {
 			Topic: publisher.Topic,
 		},
 	}
-	err := publisher.Node.Send(&command)
-	if err != nil {
-		return err
-	}
-	return nil
+	return publisher.Node.Send(&command)
+	
 }

@@ -5,28 +5,26 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"time"
 	"sync"
+	"time"
 
 	"github.com/HWZen/ros_hybrid_go/pkg/protobuf"
-	"github.com/HWZen/ros_hybrid_go/src/ros_hybrid_error"
+	ros_hybrid_go "github.com/HWZen/ros_hybrid_go/src/ros_hybrid_error"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
-	set "github.com/deckarep/golang-set"
 )
 
 const delimiter_str = "___delimiter___"
+
 var delimiter = []byte(delimiter_str)
 
 type Node struct {
-	connect 					net.Conn
-	connect_scan 				*bufio.Scanner
-	stop_cond 					sync.Cond
-	agent_config 				*protobuf.AgentConfig
-	subscriber_channels 		map[string]set.Set
-	service_server_channels 	map[string]*chan *protobuf.Command_CallService
-	service_client_channels 	map[string]set.Set
+	connect                net.Conn
+	connect_scan           *bufio.Scanner
+	stop_cond              sync.Cond
+	agent_config           *protobuf.AgentConfig
+	subscriberObservers    map[string]msgObserver
+	serviceServerObservers map[string]msgObserver
+	serviceClientObservers map[string]msgObserver
 	// set a logger
 }
 
@@ -57,9 +55,9 @@ func init_connection(host string, name string) (*Node, error) {
 
 	// login to server
 	agentConfig := protobuf.AgentConfig{
-		Node: name,
+		Node:       name,
 		IsProtobuf: proto.Bool(true),
-		Delimiter: delimiter,
+		Delimiter:  delimiter,
 	}
 
 	out, err := proto.Marshal(&agentConfig)
@@ -68,7 +66,7 @@ func init_connection(host string, name string) (*Node, error) {
 	}
 	conn.Write(out)
 
-	if !scanner.Scan(){
+	if !scanner.Scan() {
 		return nil, ros_hybrid_go.NewError("login failed")
 	}
 	data := scanner.Bytes()
@@ -83,95 +81,70 @@ func init_connection(host string, name string) (*Node, error) {
 	}
 
 	return &Node{
-		connect: conn,
-		connect_scan: scanner,
-		agent_config: &agentConfig,
-		stop_cond: *sync.NewCond(&sync.Mutex{}),
-		subscriber_channels: make(map[string]set.Set),
-		service_server_channels: make(map[string]*chan *protobuf.Command_CallService),
-		service_client_channels: make(map[string]set.Set),
-		}, nil
+		connect:                conn,
+		connect_scan:           scanner,
+		agent_config:           &agentConfig,
+		stop_cond:              *sync.NewCond(&sync.Mutex{}),
+		subscriberObservers:    make(map[string]msgObserver),
+		serviceServerObservers: make(map[string]msgObserver),
+		serviceClientObservers: make(map[string]msgObserver),
+	}, nil
 
 }
 
 func recver(node *Node) {
-    for node.connect_scan.Scan() {
-        data := node.connect_scan.Bytes()
-        comment := &protobuf.Command{}
-        if err := proto.Unmarshal(data, comment); err != nil {
+	for node.connect_scan.Scan() {
+		data := node.connect_scan.Bytes()
+		comment := &protobuf.Command{}
+		if err := proto.Unmarshal(data, comment); err != nil {
 			fmt.Println("unmarshal error: ", err)
-            continue
-        }
+			continue
+		}
 		switch comment.Type {
-        case protobuf.Command_PUBLISH :
+		case protobuf.Command_PUBLISH:
 			publish := comment.GetPublish()
-			if channelSet, ok := node.subscriber_channels[publish.Topic]; ok {
-				for channel := range channelSet.Iter() {
-					*channel.(*chan []byte) <- publish.GetData()
-				}
-			} else {
-				response := protobuf.Command{
-					Type: protobuf.Command_LOG,
-					Log: &protobuf.Command_Log{
-						Level : protobuf.Command_Log_ERROR,
-						Message : "no subscriber for topic: " + publish.Topic,
-						Time: timestamppb.Now(),
-					},
-				}
-				err := node.Send(&response)
-				if err != nil {
-					// log it
-					continue
-				}
+			if publish == nil {
+				fmt.Println("get publish command error: ", comment)
+				continue
 			}
-		case protobuf.Command_CALL_SERVICE :
-			call_service := comment.GetCallService()
-			if channel, ok := node.service_server_channels[call_service.Service]; ok {
-				*channel <- call_service
+			if observer, ok := node.subscriberObservers[publish.Topic]; ok {
+				go observer.Update(publish)
 			} else {
-				response := protobuf.Command{
-					Type: protobuf.Command_LOG,
-					Log: &protobuf.Command_Log{
-						Level : protobuf.Command_Log_ERROR,
-						Message : "no advertise for service: " + call_service.Service,
-						Time: timestamppb.Now(),
-					},
-				}
-				err := node.Send(&response)
-				if err != nil {
-					// log it
-					continue
-				}
+				// log it: no observer for this topic
+				fmt.Println("no observer for this topic: ", publish.Topic)
 			}
-		case protobuf.Command_RESPONSE_SERVICE :
-			response_service := comment.GetResponseService()
-			if channelSet, ok := node.service_client_channels[response_service.Service]; ok {
-				for channel := range channelSet.Iter() {
-					*channel.(*chan *protobuf.Command_ResponseService) <- response_service
-				}
+		case protobuf.Command_CALL_SERVICE:
+			callService := comment.GetCallService()
+			if callService == nil {
+				fmt.Println("get call service command error: ", comment)
+				continue
+			}
+			if observer, ok := node.serviceServerObservers[callService.Service]; ok {
+				go observer.Update(callService)
 			} else {
-				response := protobuf.Command{
-					Type: protobuf.Command_LOG,
-					Log: &protobuf.Command_Log{
-						Level : protobuf.Command_Log_ERROR,
-						Message : "no client for service: " + response_service.Service,
-						Time: timestamppb.Now(),
-					},
-				}
-				err := node.Send(&response)
-				if err != nil {
-					// log it
-					continue
-				}
+				// log it: no observer for this service
+				fmt.Println("no observer for this service: ", callService.Service)
 			}
-		case protobuf.Command_LOG :
+		case protobuf.Command_RESPONSE_SERVICE:
+			responseService := comment.GetResponseService()
+			if responseService == nil {
+				fmt.Println("get response service command error: ", comment)
+				continue
+			}
+			if observer, ok := node.serviceClientObservers[responseService.Service]; ok {
+				go observer.Update(responseService)
+			} else {
+				// log it: no observer for this service
+				fmt.Println("no observer for this service: ", responseService.Service)
+			}
+		case protobuf.Command_LOG:
 			log := comment.GetLog()
 			// log it
-			fmt.Println("get log from server: \n", log )
+			fmt.Println("get log from server: \n", log)
 		default:
-			fmt.Println("get unknown command from server: \n", comment )
+			fmt.Println("get unknown command from server: \n", comment)
 		}
-    }
+	}
 	if err := node.connect_scan.Err(); err != nil {
 		fmt.Println("error: ", err)
 	}
@@ -179,48 +152,33 @@ func recver(node *Node) {
 }
 
 func NewNode(host string, name string) (*Node, error) {
-    node, err := init_connection(host, name)
-    if err != nil {
-        return nil, err
-    }
-    return node, nil
+	node, err := init_connection(host, name)
+	if err != nil {
+		return nil, err
+	}
+	return node, nil
 }
 
-
-
-func (node *Node) Run(){
+func (node *Node) Run() {
 	recver(node)
 }
 
-func (node *Node) Shutdown(){
+func (node *Node) Shutdown() {
 	// close all channels
-	for _, chSet := range node.subscriber_channels {
-		chSet.Each(func(v interface{}) bool {
-			close(*v.(*chan []byte))
-			return true
-		})
+	for _, observers := range node.subscriberObservers {
+		observers.Shutdown()
 	}
-	for k := range node.subscriber_channels {
-		delete(node.subscriber_channels, k)
+	node.subscriberObservers = make(map[string]msgObserver)
+
+	for _, observers := range node.serviceServerObservers {
+		observers.Shutdown()
 	}
-	
-	for _, ch := range node.service_server_channels {
-		close(*ch)
+	node.serviceServerObservers = make(map[string]msgObserver)
+
+	for _, observers := range node.serviceClientObservers {
+		observers.Shutdown()
 	}
-	for k := range node.service_server_channels {
-		delete(node.service_server_channels, k)
-	}
-	
-	for _, chSet := range node.service_client_channels {
-		chSet.Each(func(v interface{}) bool {
-			close(*v.(*chan *protobuf.Command_ResponseService))
-			return true
-		})
-	}
-	for k := range node.service_client_channels {
-		delete(node.service_client_channels, k)
-	}
-	
+	node.serviceClientObservers = make(map[string]msgObserver)
 
 	// wait a second, unsubscribe\unadvertise all server
 	time.Sleep(time.Second)
@@ -230,7 +188,7 @@ func (node *Node) Shutdown(){
 	node.stop_cond.Broadcast()
 }
 
-func (node *Node) Spin(){
+func (node *Node) Spin() {
 	node.stop_cond.L.Lock()
 	node.stop_cond.Wait()
 	node.stop_cond.L.Unlock()
@@ -246,8 +204,5 @@ func (node *Node) Send(data *protobuf.Command) error {
 		return err
 	}
 	_, err = node.connect.Write(delimiter)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }

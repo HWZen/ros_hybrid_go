@@ -23,15 +23,15 @@ func main() {
 		fmt.Println(err)
 		return
 	}
+	publisher.Advertise()
 	defer publisher.Unadvertise()
 
-	subscriber := ros_hybrid_go.NewSubscriber(node, "test", "std_msgs/String", &protobuf.String{}, func(msg proto.Message) {
+	subscriber, err := ros_hybrid_go.NewSubscriber(node, "test", "std_msgs/String", &protobuf.String{}, func(msg proto.Message) {
 		real_msg := msg.(*protobuf.String)
 		fmt.Println("Received: ", real_msg.Data)
 		// sleep 1.1 seconds to simulate a long callback
 		time.Sleep(time.Millisecond * 1100)
 	})
-	err = subscriber.Subscribe()
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -71,7 +71,6 @@ func main() {
 
 	time.Sleep(time.Second * 1)
 	service_client := ros_hybrid_go.NewServiceCaller(node, "test_service", "ros_hybrid_sdk/MyService", &protobuf.MyService_Response{})
-	defer service_client.Close()
 	res, err := service_client.Call(&protobuf.MyService_Request{
 		MyMsg: &protobuf.MyMsg{
 			I: 1000,

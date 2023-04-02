@@ -1,109 +1,107 @@
 package ros_hybrid_go
 
 import (
-	"sync"
 
 	"github.com/HWZen/ros_hybrid_go/pkg/protobuf"
-	"github.com/HWZen/ros_hybrid_go/src/ros_hybrid_error"
+	ros_hybrid_go "github.com/HWZen/ros_hybrid_go/src/ros_hybrid_error"
 	"google.golang.org/protobuf/proto"
 
-	set "github.com/deckarep/golang-set"
 )
 
 type ServiceCaller struct {
-	node 			*Node
-	ServiceName 	string
-	TypeName 		string
-	SrvSample 		proto.Message
-	seq 			uint64
-	channel 		chan *protobuf.Command_ResponseService
-	reqChanPool 	sync.Pool
-	seqReqChanMap 	map[uint64]chan *protobuf.Command_ResponseService
-
+	node          *Node
+	ServiceName   string
+	TypeName      string
+	SrvSample     proto.Message
+	seq           uint64
+	reqHandle     map[uint64]func (*protobuf.Command_ResponseService)
 }
 
+
 func NewServiceCaller(node *Node, serviceName string, typeName string, srvSample proto.Message) *ServiceCaller {
+	if caller, exist := node.serviceClientObservers[serviceName]; exist{
+		return caller.(*ServiceCaller)
+	}
 	serviceCaller := &ServiceCaller{
-		node: node,
+		node:        node,
 		ServiceName: serviceName,
-		TypeName: typeName,
-		SrvSample: srvSample,
-		channel: make(chan *protobuf.Command_ResponseService),
-		reqChanPool: sync.Pool{
-			New: func() interface{} {
-				return make(chan *protobuf.Command_ResponseService)
-			},
-		},
-		seqReqChanMap: make(map[uint64]chan *protobuf.Command_ResponseService),
-		
+		TypeName:    typeName,
+		SrvSample:   srvSample,
+		seq:         0,
+		reqHandle:   make(map[uint64]func (*protobuf.Command_ResponseService)),
 	}
-	if _, exist := node.service_client_channels[serviceName]; !exist {
-		node.service_client_channels[serviceName] = set.NewSet()
-	}
-	node.service_client_channels[serviceName].Add(&serviceCaller.channel)
-	go func (caller *ServiceCaller) {
-		for responseMsg, ok := <-caller.channel; ok; responseMsg, ok = <-caller.channel {
-			callChannel, exist := caller.seqReqChanMap[responseMsg.Seq]
-			if !exist {
-				continue
-			}
-			callChannel <- responseMsg
-		}
-	}(serviceCaller)
+	node.serviceClientObservers[serviceName] = serviceCaller
 	return serviceCaller
 }
 
-func (caller *ServiceCaller) Call(req proto.Message) (proto.Message, error) {
-	dataBuf, err := proto.Marshal(req)
-	if err != nil {
-		return nil, err
+func (caller *ServiceCaller) Update(resMsg proto.Message) {
+	response := resMsg.(*protobuf.Command_ResponseService)
+	if response.GetService() != caller.ServiceName {
+		return
 	}
+	if handle := caller.reqHandle[response.GetSeq()]; handle != nil {
+		handle(response)
+		caller.reqHandle[response.GetSeq()] = nil
+	}
+}
+
+func (caller *ServiceCaller) Shutdown() {
+
+}
+
+func (caller *ServiceCaller) AsyncCall(req proto.Message, callback func(proto.Message, error)) error{
+	data, err := proto.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	caller.seq++
 	command := protobuf.Command{
 		Type: protobuf.Command_CALL_SERVICE,
 		CallService: &protobuf.Command_CallService{
 			Service: caller.ServiceName,
-			Type: caller.TypeName,
-			Seq: caller.seq,
-			Data: dataBuf,
+			Type:    caller.TypeName,
+			Seq:     caller.seq,
+			Data: 	 data,
 		},
 	}
-	callChannel := caller.reqChanPool.Get().(chan *protobuf.Command_ResponseService)
-	caller.seqReqChanMap[caller.seq] = callChannel
-	defer func(caller *ServiceCaller) {
-		delete(caller.seqReqChanMap, caller.seq)
-		caller.reqChanPool.Put(callChannel)
-	}(caller)
-	caller.seq++
 	err = caller.node.Send(&command)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	responseMsg, ok := <-callChannel
-	if !ok {
-		return nil, ros_hybrid_go.NewError("service caller channel closed")
+	caller.reqHandle[caller.seq] = func (res *protobuf.Command_ResponseService) {
+		if !res.GetSuccess() {
+			callback(nil, ros_hybrid_go.NewError("service call failed: " + res.GetErrorMessage()))
+		}
+		callbackData := proto.Clone(caller.SrvSample)
+		err := proto.Unmarshal(res.GetData(), callbackData)
+		if err != nil {
+			callback(nil, err)
+		}
+		
+		callback(callbackData, nil)
 	}
-	if !responseMsg.Success {
-		return nil, ros_hybrid_go.NewError(responseMsg.GetErrorMessage())
+	return nil
+}
+
+func (caller *ServiceCaller) Call(req proto.Message) (proto.Message, error) {
+	getCallbackFunc := func(res *proto.Message, err *error, resultCh chan struct{}) func (proto.Message, error) {
+		return func (callbackRes proto.Message, callbackErr error) {
+			*res = callbackRes
+			*err = callbackErr
+			close(resultCh)
+		}
 	}
-	response := proto.Clone(caller.SrvSample)
-	err = proto.Unmarshal(responseMsg.Data, response)
+	var res proto.Message
+	var err error
+	result := make(chan struct{})
+
+	caller.AsyncCall(req, getCallbackFunc(&res, &err, result))
 	if err != nil {
 		return nil, err
 	}
-	return response, nil
-}
 
-func (caller *ServiceCaller) AsyncCall(req proto.Message, callback func(proto.Message, error)) {
-	go func() {
-		response, err := caller.Call(req)
-		callback(response, err)
-	}()
-}
+	<-result
 
-func (caller *ServiceCaller) Close() {
-	if _, exist := caller.node.service_client_channels[caller.ServiceName]; exist {
-		delete(caller.node.service_client_channels, caller.ServiceName)
-		close(caller.channel)
-	}
+	return res, nil
 }
-
